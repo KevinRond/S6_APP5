@@ -12,8 +12,8 @@
 #include <string>
 #include <cstring>
 #include <thread>
-
-// echo "data/ic_adb_48px.svg;out-480.png;480" | ./asset_conv 2> err.log
+#include <mutex>
+#include <condition_variable>
 
 namespace gif643 {
 
@@ -197,9 +197,11 @@ public:
 /// Two main methods are offered: 
 ///  - parseAndRun(...): Parses a task definition string and immediately
 ///    processes the request. Blocking call.
+///    parseAndRun EST LE CONSOMMATEUR
 ///  - parseAndQueue(...): Parses a task definition string and put it at the
 ///    back of a queue for future processing. Returns immediately. If the 
 ///    definition is valid it will be processed in the future.
+///    parseAndQueue EST LE PRODUCTEUR
 ///
 /// TODO: Process assets in a thread pool.
 /// TODO: Cache the PNG result in memory if the same requests arrives again.
@@ -209,6 +211,8 @@ class Processor
 private:
     // The tasks to run queue (FIFO).
     std::queue<TaskDef> task_queue_;
+    std::mutex      mutex_;
+    std::condition_variable cv_;
 
     // The cache hash map (TODO). Note that we use the string definition as the // key.
     using PNGHashMap = std::unordered_map<std::string, PNGDataPtr>;
@@ -247,8 +251,12 @@ public:
 
     ~Processor()
     {
+        {
+        std::lock_guard<std::mutex> lock(mutex_);
         should_run_ = false;
-        for (auto& qthread: queue_threads_) {
+        }
+        cv_.notify_all();
+        for (auto& qthread : queue_threads_) {
             qthread.join();
         }
     }
@@ -313,13 +321,16 @@ public:
         TaskDef def;
         if (parse(line_org, def)) {
             std::cerr << "Queueing task '" << line_org << "'." << std::endl;
+            std::lock_guard<std::mutex> lock(mutex_);
             task_queue_.push(def);
+            cv_.notify_one();
         }
     }
 
     /// \brief Returns if the internal queue is empty (true) or not.
     bool queueEmpty()
     {
+        std::lock_guard<std::mutex> lock(mutex_);
         return task_queue_.empty();
     }
 
@@ -327,14 +338,26 @@ private:
     /// \brief Queue processing thread function.
     void processQueue()
     {
-        while (should_run_) {
-            if (!task_queue_.empty()) {
-                TaskDef task_def = task_queue_.front();
-                task_queue_.pop();
-                TaskRunner runner(task_def);
-                runner();
-            }
+        while (true) {
+        TaskDef task;
+
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+
+            cv_.wait(lock, [this] {
+                return !task_queue_.empty() || !should_run_;
+            });
+
+            if (!should_run_ && task_queue_.empty())
+                return;
+
+            task = task_queue_.front();
+            task_queue_.pop();
         }
+
+        TaskRunner runner(task);
+        runner();
+    }
     }
 };
 
