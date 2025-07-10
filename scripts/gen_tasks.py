@@ -23,3 +23,8 @@ for f in files:
         os.path.join(dirname, f),
         os.path.join(out_dirname, pngname),
         width))
+    # uncomment pour tester la cache
+    # print("%s;%s;%s"%(
+    #     os.path.join(dirname, f),
+    #     os.path.join(out_dirname, pngname),
+    #     width))

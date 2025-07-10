@@ -104,6 +104,7 @@ struct TaskDef
     std::string fname_in;
     std::string fname_out; 
     int size;
+    std::string task_def_string;
 };
 
 /// \brief A class representing the processing of one SVG file to a PNG stream.
@@ -121,7 +122,7 @@ public:
     {
     }
 
-    void operator()()
+    PNGDataPtr operator()()
     {
         const std::string&  fname_in    = task_def_.fname_in;
         const std::string&  fname_out   = task_def_.fname_out;
@@ -138,6 +139,7 @@ public:
 
         NSVGimage*          image_in        = nullptr;
         NSVGrasterizer*     rast            = nullptr;
+        PNGDataPtr data = nullptr;
 
         try {
             // Read the file ...
@@ -164,6 +166,8 @@ public:
             PNGWriter writer;
             writer(width, height, BPP, &image_data[0], stride);
 
+            data = writer.getData();
+
             // Write it out ...
             std::ofstream file_out(fname_out, std::ofstream::binary);
             auto data = writer.getData();
@@ -175,6 +179,7 @@ public:
                       << ": "
                       << e.what()
                       << std::endl;
+            return data;
         }
         
         // Bring down ...
@@ -186,6 +191,8 @@ public:
                   << fname_in 
                   << "." 
                   << std::endl;
+
+        return data;
     }
 };
 
@@ -212,6 +219,7 @@ private:
     // The tasks to run queue (FIFO).
     std::queue<TaskDef> task_queue_;
     std::mutex      mutex_;
+    std::mutex      mutex_cache_;
     std::condition_variable cv_;
 
     // The cache hash map (TODO). Note that we use the string definition as the // key.
@@ -233,6 +241,7 @@ public:
     Processor(int n_threads = NUM_THREADS):
         should_run_(true)
     {
+        printf("creating a processor");
         if (n_threads <= 0) {
             std::cerr << "Warning, incorrect number of threads ("
                       << n_threads
@@ -292,7 +301,8 @@ public:
             def = {
                 fname_in,
                 fname_out,
-                width
+                width,
+                line_org
             };
 
             return true;
@@ -320,7 +330,6 @@ public:
         std::queue<TaskDef> queue;
         TaskDef def;
         if (parse(line_org, def)) {
-            std::cerr << "Queueing task '" << line_org << "'." << std::endl;
             std::lock_guard<std::mutex> lock(mutex_);
             task_queue_.push(def);
             cv_.notify_one();
@@ -339,26 +348,54 @@ private:
     void processQueue()
     {
         while (true) {
-        TaskDef task;
+            TaskDef task;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this] {
+                    return !task_queue_.empty() || !should_run_;
+                });
 
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
+                if (!should_run_ && task_queue_.empty())
+                    return;
 
-            cv_.wait(lock, [this] {
-                return !task_queue_.empty() || !should_run_;
-            });
+                task = task_queue_.front();
+                task_queue_.pop();
+            }
 
-            if (!should_run_ && task_queue_.empty())
-                return;
+            bool shouldRender = false;
 
-            task = task_queue_.front();
-            task_queue_.pop();
+            {
+                std::lock_guard<std::mutex> lock(mutex_cache_);
+                if (png_cache_.find(task.task_def_string) == png_cache_.end()) {
+                    // Reserve the key with a null value to prevent races
+                    png_cache_[task.task_def_string] = nullptr;
+                    shouldRender = true;
+                } else {
+                    std::cerr << "Cache hit (skip render): " << task.task_def_string << std::endl;
+                    auto data = png_cache_[task.task_def_string];
+                    if (data) {
+                        std::ofstream file_out(task.fname_out, std::ios::binary);
+                        file_out.write(&(data->front()), data->size());
+                    }
+                }
+            }
+
+            if (!shouldRender)
+                continue;
+
+            // Only one thread reaches here for each task_def_string
+            TaskRunner runner(task);
+            PNGDataPtr result = runner();
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_cache_);
+                png_cache_[task.task_def_string] = result;
+                std::cerr << "Task cached: " << task.task_def_string << std::endl;
+                std::cerr << "Cache size: " << png_cache_.size() << std::endl;
+            }
         }
+    }
 
-        TaskRunner runner(task);
-        runner();
-    }
-    }
 };
 
 }
@@ -368,30 +405,37 @@ int main(int argc, char** argv)
     using namespace gif643;
 
     std::ifstream file_in;
+    int num_threads = NUM_THREADS;
 
-    if (argc >= 2 && (strcmp(argv[1], "-") != 0)) {
+    // Argument parsing
+    if (argc >= 2 && strcmp(argv[1], "-") != 0 && strstr(argv[1], ".txt")) {
         file_in.open(argv[1]);
         if (file_in.is_open()) {
             std::cin.rdbuf(file_in.rdbuf());
             std::cerr << "Using " << argv[1] << "..." << std::endl;
         } else {
-            std::cerr   << "Error: Cannot open '"
-                        << argv[1] 
-                        << "', using stdin (press CTRL-D for EOF)." 
+            std::cerr   << "Error: Cannot open '" << argv[1]
+                        << "', using stdin (press CTRL-D for EOF)."
                         << std::endl;
         }
     } else {
         std::cerr << "Using stdin (press CTRL-D for EOF)." << std::endl;
     }
 
-    // TODO: change the number of threads from args.
-    Processor proc;
+    if (argc >= 3) {
+        num_threads = std::stoi(argv[2]);
+        if (num_threads <= 0) {
+            std::cerr << "Invalid thread count '" << argv[2]
+                      << "', using default (" << NUM_THREADS << ")"
+                      << std::endl;
+            num_threads = NUM_THREADS;
+        }
+    }
+
+    Processor proc(num_threads);
     
-    while (!std::cin.eof()) {
-
-        std::string line, line_org;
-
-        std::getline(std::cin, line);
+    std::string line;
+    while (std::getline(std::cin, line)) {
         if (!line.empty()) {
             proc.parseAndQueue(line);
         }
@@ -401,6 +445,7 @@ int main(int argc, char** argv)
         file_in.close();
     }
 
-    // Wait until the processor queue's has tasks to do.
+    // Wait until all tasks are done.
     while (!proc.queueEmpty()) {};
 }
+
